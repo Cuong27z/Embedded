@@ -1,0 +1,422 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
+
+// ===================== WIFI / MQTT CONFIG =====================
+const char* WIFI_SSID     = "ThienMinh 5G";
+const char* WIFI_PASSWORD = "20032019";
+
+const char* MQTT_HOST = "0deb728082f94ac89c3920bc4dcb78b9.s1.eu.hivemq.cloud";
+const uint16_t MQTT_PORT = 8883; // TLS
+
+// HiveMQ Cloud usually requires username/password:
+const char* MQTT_USERNAME = "cuong27";
+const char* MQTT_PASSWORD = "Cuong123";
+
+const char* TOPIC_CMD = "home/door2/cmd";      // subscribe
+const char* TOPIC_STATUS = "home/door2/status"; // publish (optional)
+
+// ======= QUICK OPTION (EASIEST): insecure TLS (no CA check) =======
+// For production, you should set a CA cert instead of setInsecure().
+// We'll use setInsecure() here to keep it simple & working quickly.
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+// ===================== YOUR ORIGINAL HARDWARE CONFIG =====================
+int lcdColumns = 16;
+int lcdRows = 2;
+LiquidCrystal_I2C lcd(0x27, lcdColumns, lcdRows);
+
+#define RX_PIN 16  // ESP32 RX <- sensor TX
+#define TX_PIN 17  // ESP32 TX -> sensor RX
+#define relayPin 23
+
+uint8_t id;
+boolean mode = 0;  // (your code effectively always uses 0)
+
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char hexaKeys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+byte rowPins[ROWS] = {13, 12, 14, 27};
+byte colPins[COLS] = {26, 25, 33, 32};
+
+Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial2);
+
+// ===================== Helper: unlock door pulse =====================
+void unlockDoorPulse(uint16_t ms = 100) {
+  digitalWrite(relayPin, HIGH);
+  delay(ms);
+  digitalWrite(relayPin, LOW);
+}
+
+// ===================== LCD helper (your function) =====================
+void displayText(String text) {
+  int length = text.length();
+  lcd.setCursor(0, 0);
+  lcd.print(text.substring(0, min(16, length)));
+
+  if (length > 16) {
+    lcd.setCursor(0, 1);
+    lcd.print(text.substring(16, min(32, length)));
+  }
+  delay(1500);
+  lcd.clear();
+}
+
+// ===================== Read ID from keypad (your function) =====================
+uint8_t readIDFromKeypad() {
+  String input = "";
+  char key;
+
+  while (true) {
+    // Keep MQTT alive while waiting for keypad input
+    mqttClient.loop();
+
+    key = customKeypad.getKey();
+    if (key) {
+      if (key == '#') {
+        if (input.length() > 0) {
+          uint8_t idValue = input.toInt();
+          if (idValue >= 1 && idValue <= 127) {
+            displayText("ID entered");
+            return idValue;
+          } else {
+            displayText("Invalid ID! 1-127");
+            input = "";
+          }
+        }
+      } else if (isdigit((unsigned char)key)) {
+        if (input.length() < 3) {
+          input += key;
+          lcd.print(key);
+        }
+      } else {
+        displayText("Invalid key! #");
+      }
+    }
+    delay(10);
+  }
+}
+
+// ===================== Fingerprint functions (mostly your code) =====================
+void DeleteChooseFingerprint() {
+  displayText("Enter ID delete:");
+  uint8_t deleteID = readIDFromKeypad();
+
+  int p = finger.deleteModel(deleteID);
+  if (p == FINGERPRINT_OK) {
+    displayText("Deleted ID " + String(deleteID));
+    mqttClient.publish(TOPIC_STATUS, ("DeletedID:" + String(deleteID)).c_str());
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    displayText("Comm error del");
+  } else if (p == FINGERPRINT_BADLOCATION) {
+    displayText("Bad location");
+  } else if (p == FINGERPRINT_FLASHERR) {
+    displayText("Flash error");
+  } else {
+    displayText("Unknown error");
+  }
+}
+
+void DeleteAllFingerprints() {
+  displayText("Erasing all...");
+  finger.emptyDatabase();
+  displayText("All erased");
+  mqttClient.publish(TOPIC_STATUS, "AllErased");
+}
+
+uint8_t addFingerprint() {
+  int p = -1;
+  displayText("Enter ID (1-127):");
+  id = readIDFromKeypad();
+
+  displayText("Place finger");
+  delay(1500);
+
+  while (p != FINGERPRINT_OK) {
+    mqttClient.loop();
+    p = finger.getImage();
+    switch (p) {
+      case FINGERPRINT_OK: displayText("Image taken"); break;
+      case FINGERPRINT_NOFINGER: displayText("."); break;
+      case FINGERPRINT_PACKETRECIEVEERR: displayText("Comm error"); break;
+      case FINGERPRINT_IMAGEFAIL: displayText("Imaging error"); break;
+      default: displayText("Unknown error"); break;
+    }
+  }
+
+  p = finger.image2Tz(1);
+  switch (p) {
+    case FINGERPRINT_OK: displayText("Image converted"); break;
+    case FINGERPRINT_IMAGEMESS: displayText("Too messy"); return p;
+    case FINGERPRINT_PACKETRECIEVEERR: displayText("Comm error"); return p;
+    case FINGERPRINT_FEATUREFAIL:
+    case FINGERPRINT_INVALIDIMAGE: displayText("No features"); return p;
+    default: displayText("Unknown error"); return p;
+  }
+
+  displayText("Remove finger");
+  displayText("Place again");
+
+  p = 0;
+  while (p != FINGERPRINT_NOFINGER) {
+    mqttClient.loop();
+    p = finger.getImage();
+    delay(10);
+  }
+
+  p = -1;
+  while (p != FINGERPRINT_OK) {
+    mqttClient.loop();
+    p = finger.getImage();
+    switch (p) {
+      case FINGERPRINT_OK: displayText("Image taken"); break;
+      case FINGERPRINT_NOFINGER: displayText("."); break;
+      case FINGERPRINT_PACKETRECIEVEERR: displayText("Comm error"); break;
+      case FINGERPRINT_IMAGEFAIL: displayText("Imaging error"); break;
+      default: displayText("Unknown error"); break;
+    }
+  }
+
+  p = finger.image2Tz(2);
+  switch (p) {
+    case FINGERPRINT_OK: displayText("Image converted"); break;
+    case FINGERPRINT_IMAGEMESS: displayText("Too messy"); return p;
+    case FINGERPRINT_PACKETRECIEVEERR: displayText("Comm error"); return p;
+    case FINGERPRINT_FEATUREFAIL:
+    case FINGERPRINT_INVALIDIMAGE: displayText("No features"); return p;
+    default: displayText("Unknown error"); return p;
+  }
+
+  lcd.print("Creating model#");
+  lcd.setCursor(0, 1);
+  lcd.print(String(id));
+  delay(1000);
+  lcd.clear();
+
+  p = finger.createModel();
+  if (p == FINGERPRINT_OK) {
+    displayText("Matched!");
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    displayText("Comm error");
+    return p;
+  } else if (p == FINGERPRINT_ENROLLMISMATCH) {
+    displayText("Not match");
+    return p;
+  } else {
+    displayText("Unknown error");
+    return p;
+  }
+
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) {
+    displayText("Stored!");
+    mqttClient.publish(TOPIC_STATUS, ("EnrolledID:" + String(id)).c_str());
+    return p;
+  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
+    displayText("Comm error");
+    return p;
+  } else if (p == FINGERPRINT_BADLOCATION) {
+    displayText("Bad location");
+    return p;
+  } else if (p == FINGERPRINT_FLASHERR) {
+    displayText("Flash error");
+    return p;
+  } else {
+    displayText("Store fail");
+    return p;
+  }
+}
+
+void checkFingerprint() {
+  displayText("Place finger...");
+  delay(1500);
+
+  uint8_t p = finger.getImage();
+  if (p != FINGERPRINT_OK) return;
+
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    displayText("Convert fail");
+    return;
+  }
+
+  p = finger.fingerFastSearch();
+  if (p == FINGERPRINT_OK) {
+    lcd.print("Fingerprint ID ");
+    lcd.setCursor(0, 1);
+    lcd.print(finger.fingerID);
+    delay(1500);
+    lcd.clear();
+
+    lcd.print("confidence ");
+    lcd.setCursor(0, 1);
+    lcd.print(finger.confidence);
+    delay(1500);
+    lcd.clear();
+  } else if (p == FINGERPRINT_NOTFOUND) {
+    displayText("Not found");
+  } else {
+    displayText("Search error");
+  }
+}
+
+void checkFingerprintAndUnlock() {
+  // Non-blocking-ish: if no finger, just return quickly
+  uint8_t p = finger.getImage();
+  if (p != FINGERPRINT_OK) return;
+
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) return;
+
+  p = finger.fingerFastSearch();
+  if (p == FINGERPRINT_OK) {
+    unlockDoorPulse(100);
+    displayText("Door unlocked!");
+    mqttClient.publish(TOPIC_STATUS, ("UnlockedByFP:ID=" + String(finger.fingerID)).c_str());
+  }
+}
+
+// ===================== MQTT callback =====================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // Convert payload to String safely
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+  // Only care about home/door2/cmd
+  if (String(topic) == TOPIC_CMD) {
+    if (msg == "Open") {
+      displayText("MQTT: Open");
+      unlockDoorPulse(100);
+      mqttClient.publish(TOPIC_STATUS, "UnlockedByMQTT");
+    }
+  }
+}
+
+// ===================== Connect WiFi =====================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  lcd.clear();
+  lcd.print("WiFi connecting");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    mqttClient.loop();
+    delay(500);
+    lcd.setCursor(0, 1);
+    lcd.print("Try " + String(++tries));
+    if (tries > 40) break; // ~20s
+  }
+  lcd.clear();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    displayText("WiFi connected");
+  } else {
+    displayText("WiFi failed");
+  }
+}
+
+// ===================== Connect MQTT =====================
+void connectMQTT() {
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  // Quick setup: don't validate cert chain (works, but not secure).
+  secureClient.setInsecure();
+
+  while (!mqttClient.connected()) {
+    mqttClient.loop();
+    displayText("MQTT connecting");
+    String clientId = "door2-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    bool ok = mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD);
+    if (ok) {
+      displayText("MQTT connected");
+      mqttClient.subscribe(TOPIC_CMD);
+      mqttClient.publish(TOPIC_STATUS, "Online");
+    } else {
+      displayText("MQTT retry...");
+      delay(1000);
+    }
+  }
+}
+
+// ===================== Arduino setup/loop =====================
+void setup() {
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
+
+  Serial.begin(57600);
+  delay(100);
+
+  Serial2.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
+  finger.begin(57600);
+
+  if (finger.verifyPassword()) {
+    displayText("Found finger!");
+  } else {
+    displayText("No finger sensor");
+    while (1) { delay(1); }
+  }
+
+  connectWiFi();
+  connectMQTT();
+}
+
+void loop() {
+  // Keep MQTT alive
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+  mqttClient.loop();
+
+  // Keypad handling (your logic)
+  char customKey = customKeypad.getKey();
+  switch (customKey) {
+    case 'A':
+      displayText("Add mode");
+      mode = 0;
+      delay(200);
+      addFingerprint();
+      break;
+    case 'B':
+      DeleteChooseFingerprint();
+      break;
+    case 'C':
+      DeleteAllFingerprints();
+      break;
+    case 'D':
+      checkFingerprint();
+      break;
+    default:
+      break;
+  }
+
+  // Auto scan to unlock (your behavior)
+  if (mode == 0) {
+    checkFingerprintAndUnlock();
+  }
+
+  delay(10);
+}
